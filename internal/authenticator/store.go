@@ -57,11 +57,11 @@ type Entry struct {
 
 	// GroupsSeparator is the single character the Check path joins the
 	// impersonated groups with into the single groups header value
-	// (spec.groupsHeaderSeparator, default ","), and the character the
+	// (spec.groupsHeaderSeparator, default "|"), and the character the
 	// unsafe-group guard rejects inside a group name. The reconciler records it
-	// validated and normalized (an empty spec value becomes the default comma), so
-	// the Check path applies no further defaulting beyond the zero-value fallback
-	// in groupsSeparator.
+	// validated and normalized (an empty spec value becomes the default vertical
+	// pipe), so the Check path applies no further defaulting beyond the zero-value
+	// fallback in groupsSeparator.
 	GroupsSeparator string
 
 	// Impersonation is the resolved delegated-impersonation config
@@ -75,7 +75,7 @@ type Entry struct {
 }
 
 // groupsSeparator returns the Entry's configured groups-header separator,
-// defaulting to DefaultGroupsSeparator (",") when unset so a zero-value Entry
+// defaulting to DefaultGroupsSeparator ("|") when unset so a zero-value Entry
 // (e.g. one built directly in tests) behaves as the documented default.
 func (e *Entry) groupsSeparator() string {
 	if e.GroupsSeparator == "" {

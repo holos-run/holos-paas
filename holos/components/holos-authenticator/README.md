@@ -14,9 +14,10 @@ privileged credential, so Envoy forwards the request straight to the API server.
 > **Groups are a single separator-joined header that needs a paired Lua split
 > filter.** The authorizer writes the mapped groups as one joined value under the
 > configured groups header (default `X-Impersonate-Groups`,
-> `--impersonate-groups-header`; the join character defaults to a comma and is
-> configurable per `Backend` via `spec.groupsHeaderSeparator` — e.g. `|` when
-> group names contain commas, like LDAP DNs) with
+> `--impersonate-groups-header`; the join character defaults to a vertical pipe
+> `|` — chosen because LDAP/AD-style group names like `cn=bob,o=example` commonly
+> contain commas — and is configurable per `Backend` via
+> `spec.groupsHeaderSeparator`, ADR-23 Revision 14) with
 > the **overwrite/set** action, **not** as per-group `Impersonate-Group` append
 > options — Envoy's ext_authz path drops an appended header when the request does
 > not already carry it, which silently lost every group (HOL-1416). The header must
@@ -26,8 +27,8 @@ privileged credential, so Envoy forwards the request straight to the API server.
 > `filterClass: AUTHZ` (an optional **reject** filter that refuses a client-supplied
 > copy adds defense in depth but is **not** required — smuggling prevention is the
 > authenticator's own responsibility, ADR-23 Revision 8) — see the runbook's
-> [*Splitting the comma-joined groups
-> header*](../../../docs/runbooks/holos-authenticator.md#splitting-the-comma-joined-groups-header)
+> [*Splitting the groups
+> header*](../../../docs/runbooks/holos-authenticator.md#splitting-the-groups-header)
 > and [ADR-23](../../../docs/adr/ADR-23.md) Revisions 7–8. Like the `CUSTOM`
 > `AuthorizationPolicy`, the filters belong to the deferred waypoint topology and
 > are not yet rendered by this component.

@@ -130,8 +130,8 @@ func (r *BackendReconciler) reconcileNormal(ctx context.Context, logger logr.Log
 	// to a single printable, non-space ASCII character, but re-validate
 	// defensively (like the server URL) so an Entry is never built with a
 	// separator the join/split round-trip cannot use. An empty value — the CRD
-	// default populates "," for API-served objects — normalizes to the default
-	// comma so a CR that bypassed defaulting still behaves as documented.
+	// default populates "|" for API-served objects — normalizes to the default
+	// vertical pipe so a CR that bypassed defaulting still behaves as documented.
 	groupsSeparator := backend.Spec.GroupsHeaderSeparator
 	if groupsSeparator == "" {
 		groupsSeparator = authenticator.DefaultGroupsSeparator

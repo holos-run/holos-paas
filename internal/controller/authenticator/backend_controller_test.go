@@ -570,9 +570,10 @@ func TestReconcileInvalidServerURLRejects(t *testing.T) {
 }
 
 // TestReconcileGroupsHeaderSeparatorDefaulted asserts a Backend that omits
-// spec.groupsHeaderSeparator round-trips with the CRD default comma and its
-// registered Store entry carries that default, so the Check path joins groups on
-// "," — the backward-compatible behavior.
+// spec.groupsHeaderSeparator round-trips with the CRD default vertical pipe and
+// its registered Store entry carries that default, so the Check path joins
+// groups on "|" — the separator that keeps comma-bearing LDAP/AD distinguished
+// names representable.
 func TestReconcileGroupsHeaderSeparatorDefaulted(t *testing.T) {
 	ctx := context.Background()
 	ns := makeNamespace(ctx, t)
@@ -585,29 +586,29 @@ func TestReconcileGroupsHeaderSeparatorDefaulted(t *testing.T) {
 	}
 
 	b := getBackend(ctx, t, key)
-	if got := b.Spec.GroupsHeaderSeparator; got != "," {
-		t.Errorf("spec.groupsHeaderSeparator = %q, want the CRD default \",\"", got)
+	if got := b.Spec.GroupsHeaderSeparator; got != "|" {
+		t.Errorf("spec.groupsHeaderSeparator = %q, want the CRD default \"|\"", got)
 	}
 	entry, ok := store.Get("api-sep-default.example.test")
 	if !ok {
 		t.Fatalf("store missing entry for host api-sep-default.example.test")
 	}
-	if got := entry.GroupsSeparator; got != "," {
-		t.Errorf("entry.GroupsSeparator = %q, want \",\"", got)
+	if got := entry.GroupsSeparator; got != "|" {
+		t.Errorf("entry.GroupsSeparator = %q, want \"|\"", got)
 	}
 }
 
-// TestReconcileCustomGroupsHeaderSeparator asserts a Backend configuring
-// spec.groupsHeaderSeparator "|" becomes Ready and its registered Store entry
-// carries the custom separator, so a group name containing a comma (e.g. the DN
-// "cn=bob,o=example") survives the groups-header join/split round-trip.
+// TestReconcileCustomGroupsHeaderSeparator asserts a Backend configuring a
+// non-default spec.groupsHeaderSeparator ("," here) becomes Ready and its
+// registered Store entry carries the custom separator, so the Check path joins
+// groups (and guards group names) on that character instead of the default "|".
 func TestReconcileCustomGroupsHeaderSeparator(t *testing.T) {
 	ctx := context.Background()
 	ns := makeNamespace(ctx, t)
 
 	r, store, _ := newReconciler(discoverOK)
-	b := makeBackend(ns, "backend-sep-pipe", "api-sep-pipe.example.test")
-	b.Spec.GroupsHeaderSeparator = "|"
+	b := makeBackend(ns, "backend-sep-comma", "api-sep-comma.example.test")
+	b.Spec.GroupsHeaderSeparator = ","
 	key := createBackend(ctx, t, b)
 
 	if _, err := reconcile(ctx, r, key); err != nil {
@@ -618,12 +619,12 @@ func TestReconcileCustomGroupsHeaderSeparator(t *testing.T) {
 	if s := condStatus(got, ConditionReady); s != metav1.ConditionTrue {
 		t.Errorf("Ready = %q, want True", s)
 	}
-	entry, ok := store.Get("api-sep-pipe.example.test")
+	entry, ok := store.Get("api-sep-comma.example.test")
 	if !ok {
-		t.Fatalf("store missing entry for host api-sep-pipe.example.test")
+		t.Fatalf("store missing entry for host api-sep-comma.example.test")
 	}
-	if got := entry.GroupsSeparator; got != "|" {
-		t.Errorf("entry.GroupsSeparator = %q, want \"|\"", got)
+	if got := entry.GroupsSeparator; got != "," {
+		t.Errorf("entry.GroupsSeparator = %q, want \",\"", got)
 	}
 }
 
@@ -652,8 +653,8 @@ func TestBackendGroupsHeaderSeparatorRejectsInvalid(t *testing.T) {
 				if err != nil {
 					t.Fatalf("creating Backend with omitted separator: %v", err)
 				}
-				if got := getBackend(ctx, t, client.ObjectKeyFromObject(b)).Spec.GroupsHeaderSeparator; got != "," {
-					t.Errorf("spec.groupsHeaderSeparator = %q, want defaulted \",\"", got)
+				if got := getBackend(ctx, t, client.ObjectKeyFromObject(b)).Spec.GroupsHeaderSeparator; got != "|" {
+					t.Errorf("spec.groupsHeaderSeparator = %q, want defaulted \"|\"", got)
 				}
 				return
 			}
