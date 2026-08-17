@@ -7,17 +7,21 @@ The authenticator is a controller-runtime manager that runs an **Envoy
 `ext_authz` gRPC server** and reconciles `authenticator.holos.run` **Backend**
 custom resources. Each `Backend` fronts one Kubernetes API server with OIDC
 token validation and Kubernetes impersonation: on a valid token the authorizer
-returns an OK response that sets `Impersonate-User` and a single comma-joined
+returns an OK response that sets `Impersonate-User` and a single separator-joined
 groups header and replaces the caller's `Authorization` with the backend's
 privileged credential, so Envoy forwards the request straight to the API server.
 
-> **Groups are a single comma-joined header that needs a paired Lua split filter.**
-> The authorizer writes the mapped groups as one CSV value under the configured
-> groups header (default `X-Impersonate-Groups`, `--impersonate-groups-header`) with
+> **Groups are a single separator-joined header that needs a paired Lua split
+> filter.** The authorizer writes the mapped groups as one joined value under the
+> configured groups header (default `X-Impersonate-Groups`,
+> `--impersonate-groups-header`; the join character defaults to a comma and is
+> configurable per `Backend` via `spec.groupsHeaderSeparator` — e.g. `|` when
+> group names contain commas, like LDAP DNs) with
 > the **overwrite/set** action, **not** as per-group `Impersonate-Group` append
 > options — Envoy's ext_authz path drops an appended header when the request does
 > not already carry it, which silently lost every group (HOL-1416). The header must
-> be paired with an Envoy Lua **split** filter that unpacks the comma list into one
+> be paired with an Envoy Lua **split** filter that unpacks the joined list (on the
+> same separator) into one
 > `Impersonate-Group` per group, ordered after ext_authz with the version-stable
 > `filterClass: AUTHZ` (an optional **reject** filter that refuses a client-supplied
 > copy adds defense in depth but is **not** required — smuggling prevention is the

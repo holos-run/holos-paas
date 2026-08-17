@@ -8,8 +8,10 @@
 // The ext_authz Check (HOL-1388) routes each request to a Backend by Host,
 // validates the caller's OIDC bearer token, and on success returns an OK response
 // that sets Kubernetes impersonation headers (Impersonate-User, plus a single
-// comma-joined groups header — by default X-Impersonate-Groups, configurable via
-// --impersonate-groups-header — paired with a Lua split filter, see okResponse),
+// separator-joined groups header — by default X-Impersonate-Groups joined on
+// commas, the name configurable via --impersonate-groups-header and the
+// separator per Backend via spec.groupsHeaderSeparator — paired with a Lua
+// split filter, see okResponse),
 // injects the backend's privileged
 // credential as the upstream Authorization, and removes the caller's original
 // token — so Envoy forwards the request straight to the API server. Any failure
@@ -100,6 +102,15 @@ const (
 	// Impersonate-Group the split Lua filter ultimately emits. It is configurable
 	// per deployment via --impersonate-groups-header (CheckServer.groupsHeader).
 	defaultGroupsHeader = "x-impersonate-groups"
+	// DefaultGroupsSeparator is the default character the mapped groups are
+	// joined with into the single groups header value (and that the paired Lua
+	// split filter splits back on). It is configurable per Backend via
+	// spec.groupsHeaderSeparator (Entry.GroupsSeparator) so group names that
+	// legitimately contain a comma — e.g. LDAP-style distinguished names like
+	// "cn=bob,o=example" — can be carried without being fanned into multiple
+	// groups by the split filter; the unsafe-group guard (firstUnsafeGroup)
+	// rejects a group containing whichever separator is active.
+	DefaultGroupsSeparator = ","
 	// headerWWWAuthenticate is returned on a missing-token 401 per RFC 7235.
 	headerWWWAuthenticate = "WWW-Authenticate"
 	// impersonatePrefix is the lowercase prefix every Kubernetes impersonation
@@ -150,8 +161,8 @@ type CheckServer struct {
 	// namespace).
 	namespace string
 
-	// groupsHeader is the name of the single comma-joined groups header the OK
-	// response writes the mapped groups into (HOL-1416), set from the
+	// groupsHeader is the name of the single separator-joined groups header the
+	// OK response writes the mapped groups into (HOL-1416), set from the
 	// --impersonate-groups-header flag. An empty value resolves to
 	// defaultGroupsHeader ("x-impersonate-groups") via groupsHeaderName, so a
 	// zero-value CheckServer behaves as the documented default.
@@ -215,6 +226,25 @@ func ValidateGroupsHeader(name string) (string, error) {
 		return "", fmt.Errorf("groups header name %q must not be an Impersonate-* header (it would collide with the Kubernetes impersonation headers the reject/split filters govern)", name)
 	}
 	return lower, nil
+}
+
+// ValidateGroupsSeparator validates that sep is usable as the character the
+// mapped groups are joined with into the single groups header value
+// (spec.groupsHeaderSeparator). It must be exactly one printable, non-space
+// ASCII character: a multi-character value would make the unsafe-group guard
+// and the Lua split filter's character-class split disagree, whitespace would
+// be stripped by the split filter's surrounding-whitespace trim, and a control
+// or non-ASCII byte is not a valid HTTP header-value character. The CRD's
+// pattern enforces the same shape at admission; the BackendReconciler
+// re-validates defensively (like the server URL) before building an Entry.
+func ValidateGroupsSeparator(sep string) error {
+	if sep == "" {
+		return fmt.Errorf("groups header separator must not be empty")
+	}
+	if len(sep) != 1 || sep[0] < '!' || sep[0] > '~' {
+		return fmt.Errorf("groups header separator %q must be exactly one printable, non-space ASCII character", sep)
+	}
+	return nil
 }
 
 // ValidateExtraKey reports whether key is usable as the suffix of an
@@ -397,21 +427,27 @@ func (s *CheckServer) Check(ctx context.Context, req *authv3.CheckRequest) (resp
 		return deniedResponse(typev3.StatusCode_Unauthorized, "invalid token", nil), nil
 	}
 
-	// 5b. Reject any DERIVED group unsafe under the comma-joined groups encoding
-	// (failure-closed). The groups are returned as a single comma-joined groups
-	// header (see okResponse), which the paired Lua filter splits back on commas and
-	// trims of surrounding whitespace. Two group shapes break that round-trip and
-	// could smuggle a different group:
-	//   - a comma in the value ("dev,system:masters") splits into two groups; and
+	// 5b. Reject any DERIVED group unsafe under the separator-joined groups
+	// encoding (failure-closed). The groups are returned as a single joined groups
+	// header (see okResponse) using the backend's configured separator (default
+	// comma), which the paired Lua filter splits back on that separator and trims
+	// of surrounding whitespace. Two group shapes break that round-trip and could
+	// smuggle a different group:
+	//   - the separator in the value (with the default comma, "dev,system:masters")
+	//     splits into two groups; and
 	//   - leading/trailing whitespace (" system:masters") is trimmed by the split
 	//     filter into the bare group.
-	// Both are denied rather than impersonated. This guards the self-mode derived
-	// groups; the delegated-mode passthrough groups get the same guard in step 7
-	// after their inbound value is split. The username is set with a single overwrite
-	// header (no comma-join, no split filter), so it needs no such guard.
-	if group, ok := firstUnsafeGroup(identity.Groups); ok {
-		s.log.V(1).Info("denying request: mapped group is unsafe for the Impersonate-Group encoding", "host", host, "group", group)
-		return deniedResponse(typev3.StatusCode_Forbidden, "mapped group contains a comma or surrounding whitespace", nil), nil
+	// Both are denied rather than impersonated. A group that legitimately contains
+	// a comma (e.g. the DN "cn=bob,o=example") is carried by configuring a
+	// different spec.groupsHeaderSeparator (e.g. "|") on the Backend; the guard
+	// then rejects that separator instead of the comma. This guards the self-mode
+	// derived groups; the delegated-mode passthrough groups get the same guard in
+	// step 7 after their inbound value is split. The username is set with a single
+	// overwrite header (no join, no split filter), so it needs no such guard.
+	sep := entry.groupsSeparator()
+	if group, ok := firstUnsafeGroup(identity.Groups, sep); ok {
+		s.log.V(1).Info("denying request: mapped group is unsafe for the Impersonate-Group encoding", "host", host, "group", group, "separator", sep)
+		return deniedResponse(typev3.StatusCode_Forbidden, fmt.Sprintf("mapped group contains the groups separator %q or surrounding whitespace", sep), nil), nil
 	}
 
 	// 6. Resolve the backend's privileged impersonator credential from whichever
@@ -434,7 +470,7 @@ func (s *CheckServer) Check(ctx context.Context, req *authv3.CheckRequest) (resp
 		// spec.impersonation.extra is intentionally delegated-mode-only.
 		s.log.V(1).Info("allowing request (self mode)",
 			"host", host, "user", identity.Username, "groups", len(identity.Groups))
-		return s.okResponse(identity, impersonatorToken), nil
+		return s.okResponse(identity, sep, impersonatorToken), nil
 	}
 
 	// DELEGATED mode: an inbound Impersonate-* header asked to impersonate a target.
@@ -500,14 +536,16 @@ func (s *CheckServer) Check(ctx context.Context, req *authv3.CheckRequest) (resp
 		return deniedResponse(typev3.StatusCode_Forbidden, "delegated impersonation requires Impersonate-User", nil), nil
 	}
 
-	// The actor's inbound groups round-trip through the same comma-joined groups
-	// header the Lua split filter unpacks, so they get the same unsafe-element guard
-	// as the derived groups (step 5b): a comma-bearing or surrounding-whitespace
-	// element is denied fail-closed rather than smuggled. (A group value containing a
-	// literal comma cannot be represented on this Envoy-comma-joined passthrough path
-	// — it is indistinguishable from two groups — so it is unsupported by design and
-	// rejected here, per HOL-1416.)
-	if group, ok := firstUnsafeGroup(passthroughGroups); ok {
+	// The actor's inbound groups round-trip through the same separator-joined
+	// groups header the Lua split filter unpacks, so they get the same
+	// unsafe-element guard as the derived groups (step 5b): a separator-bearing or
+	// surrounding-whitespace element is denied fail-closed rather than smuggled.
+	// (A group value containing a literal comma cannot be represented on this
+	// passthrough path regardless of the configured separator — Envoy comma-joins
+	// duplicate inbound Impersonate-Group lines, so it is indistinguishable from
+	// two groups on arrival; splitInboundGroups has already split it. A group
+	// containing the configured separator is rejected here, per HOL-1416.)
+	if group, ok := firstUnsafeGroup(passthroughGroups, sep); ok {
 		// Audit at Info level: passthrough groups are part of the delegated target
 		// identity, so unsafe values are recorded with actor and target context.
 		s.log.Info("denying delegated-impersonation request: passthrough group is unsafe for the Impersonate-Group encoding",
@@ -517,8 +555,9 @@ func (s *CheckServer) Check(ctx context.Context, req *authv3.CheckRequest) (resp
 			"actorGroups", identity.Groups,
 			"target", target,
 			"passthroughGroups", passthroughGroups,
-			"group", group)
-		return deniedResponse(typev3.StatusCode_Forbidden, "impersonated group contains a comma or surrounding whitespace", nil), nil
+			"group", group,
+			"separator", sep)
+		return deniedResponse(typev3.StatusCode_Forbidden, fmt.Sprintf("impersonated group contains the groups separator %q or surrounding whitespace", sep), nil), nil
 	}
 
 	identity.ImpersonationExtra, err = entry.Authenticator.ResolveImpersonationExtra(identity)
@@ -546,7 +585,7 @@ func (s *CheckServer) Check(ctx context.Context, req *authv3.CheckRequest) (resp
 		"target", target,
 		"passthroughGroups", passthroughGroups,
 		"targetUIDSupplied", targetUIDSupplied)
-	return s.delegatedResponse(identity, headers, passthroughGroups, impersonatorToken), nil
+	return s.delegatedResponse(identity, headers, passthroughGroups, sep, impersonatorToken), nil
 }
 
 // firstInboundImpersonationExtraHeader returns the first inbound
@@ -612,7 +651,10 @@ func firstUnrecognizedImpersonationHeader(headers map[string]string) (string, bo
 // inbound Impersonate-Group header, split on commas. Envoy comma-joins duplicate
 // header lines, so multiple kubectl --as-group values arrive as a single
 // "impersonate-group: a,b" value; splitting on commas recovers the individual
-// groups. It returns nil when no Impersonate-Group header is present (a delegated
+// groups. The comma here is Envoy's fixed duplicate-header join character and is
+// deliberately independent of the backend's configurable groups-header separator
+// (spec.groupsHeaderSeparator), which governs only the OUTBOUND groups header
+// the authorizer emits. It returns nil when no Impersonate-Group header is present (a delegated
 // request may target only a user with no groups). Elements are returned verbatim
 // (not trimmed) so the firstUnsafeGroup guard can reject a surrounding-whitespace
 // element the same way it does for derived groups; the empty-string element from an
@@ -649,20 +691,23 @@ func groupsIntersect(groups []string, allow map[string]struct{}) bool {
 	return false
 }
 
-// firstUnsafeGroup returns the first group that is unsafe under the comma-joined
-// groups encoding and true, or ("", false) if all groups are safe. A
-// group is unsafe when it contains a comma or has leading/trailing whitespace,
-// because the authorizer joins the mapped groups into one comma-separated header
-// (see okResponse) and the paired Lua filter splits it back on commas and trims
-// each element: a comma in a value would fan it into multiple impersonated groups,
-// and surrounding whitespace (" system:masters") would be trimmed into the bare
-// group — both privilege-escalation smuggling vectors. The Check path denies such
-// a request fail-closed rather than emitting it. (Whitespace interior to a value
-// is left intact; only the surrounding whitespace the split filter would strip is
-// rejected.)
-func firstUnsafeGroup(groups []string) (string, bool) {
+// firstUnsafeGroup returns the first group that is unsafe under the
+// separator-joined groups encoding and true, or ("", false) if all groups are
+// safe. A group is unsafe when it contains the configured separator character
+// (sep, default comma) or has leading/trailing whitespace, because the
+// authorizer joins the mapped groups into one separator-joined header (see
+// okResponse) and the paired Lua filter splits it back on that separator and
+// trims each element: a separator in a value would fan it into multiple
+// impersonated groups, and surrounding whitespace (" system:masters") would be
+// trimmed into the bare group — both privilege-escalation smuggling vectors. The
+// Check path denies such a request fail-closed rather than emitting it. A group
+// that legitimately contains a comma (e.g. "cn=bob,o=example") is safe once the
+// Backend configures a non-comma spec.groupsHeaderSeparator the group does not
+// contain. (Whitespace interior to a value is left intact; only the surrounding
+// whitespace the split filter would strip is rejected.)
+func firstUnsafeGroup(groups []string, sep string) (string, bool) {
 	for _, group := range groups {
-		if strings.Contains(group, ",") || strings.TrimSpace(group) != group {
+		if strings.Contains(group, sep) || strings.TrimSpace(group) != group {
 			return group, true
 		}
 	}
@@ -699,7 +744,9 @@ func bearerToken(headers map[string]string) (string, bool) {
 // names. Unlike the multi-valued groups header they need no comma-join + Lua split:
 // a single overwrite header is added unconditionally by Envoy (setCopy), so the
 // ext_authz append-drop that motivated the groups helper (HOL-1416) does not apply. The mapped
-// groups are emitted as ONE comma-joined value (e.g. "oidc:dev,oidc:ops") under
+// groups are emitted as ONE separator-joined value (e.g. "oidc:dev,oidc:ops"
+// with the default comma separator; sep is the backend's configured
+// spec.groupsHeaderSeparator) under
 // the configured groups header (s.groupsHeaderName, default X-Impersonate-Groups),
 // NOT as repeated Impersonate-Group append options (HOL-1416): Envoy's ext_authz
 // path puts an append=true header in headers_to_append, which it applies with
@@ -727,7 +774,7 @@ func bearerToken(headers map[string]string) (string, bool) {
 // path where removals are applied last — leaving the request unauthenticated to
 // the API server. The AC scopes HeadersToRemove to the "cannot be overwritten in
 // place" case, which does not apply here.
-func (s *CheckServer) okResponse(identity *Identity, impersonatorToken string) *authv3.CheckResponse {
+func (s *CheckServer) okResponse(identity *Identity, sep, impersonatorToken string) *authv3.CheckResponse {
 	headers := make([]*corev3.HeaderValueOption, 0, 4+len(identity.Extra))
 	headers = append(headers, overwriteHeader(headerImpersonateUser, identity.Username))
 	// UID is single-valued, so it is set directly as Impersonate-Uid with the
@@ -738,7 +785,7 @@ func (s *CheckServer) okResponse(identity *Identity, impersonatorToken string) *
 		headers = append(headers, overwriteHeader(headerImpersonateUID, identity.UID))
 	}
 	if len(identity.Groups) > 0 {
-		headers = append(headers, overwriteHeader(s.groupsHeaderName(), strings.Join(identity.Groups, ",")))
+		headers = append(headers, overwriteHeader(s.groupsHeaderName(), strings.Join(identity.Groups, sep)))
 	}
 	// Each extra is single-valued and set directly as Impersonate-Extra-<key> with
 	// the overwrite action. Keys are emitted in lexical order so the response (and
@@ -771,7 +818,7 @@ func (s *CheckServer) okResponse(identity *Identity, impersonatorToken string) *
 // the Lua split filter unpacks, and that split filter removes only the groups header,
 // not the original Impersonate-Group — so without this removal the API server would
 // see the stale comma-joined client value alongside the split lines.
-func (s *CheckServer) delegatedResponse(identity *Identity, headers map[string]string, passthroughGroups []string, impersonatorToken string) *authv3.CheckResponse {
+func (s *CheckServer) delegatedResponse(identity *Identity, headers map[string]string, passthroughGroups []string, sep, impersonatorToken string) *authv3.CheckResponse {
 	out := make([]*corev3.HeaderValueOption, 0, 4+len(identity.ImpersonationExtra))
 	// Forward the actor-supplied target user verbatim. A delegated request always
 	// carries at least one Impersonate-* header (the mode switch), but not necessarily
@@ -783,12 +830,13 @@ func (s *CheckServer) delegatedResponse(identity *Identity, headers map[string]s
 	if uid, ok := headers[strings.ToLower(headerImpersonateUID)]; ok {
 		out = append(out, overwriteHeader(headerImpersonateUID, uid))
 	}
-	// Re-emit the actor-supplied groups through the comma-joined groups header + Lua
-	// split, exactly as self mode does — never as a bare Impersonate-Group, which
-	// Envoy's ext_authz append path would drop (HOL-1416). The elements were already
-	// checked for unsafe (comma/surrounding-whitespace) values by the caller.
+	// Re-emit the actor-supplied groups through the separator-joined groups header
+	// + Lua split, exactly as self mode does — never as a bare Impersonate-Group,
+	// which Envoy's ext_authz append path would drop (HOL-1416). The elements were
+	// already checked for unsafe (separator/surrounding-whitespace) values by the
+	// caller.
 	if len(passthroughGroups) > 0 {
-		out = append(out, overwriteHeader(s.groupsHeaderName(), strings.Join(passthroughGroups, ",")))
+		out = append(out, overwriteHeader(s.groupsHeaderName(), strings.Join(passthroughGroups, sep)))
 	}
 	// Stamp the actor's own identity into Impersonate-Extra-<key> headers — the
 	// only actor-derived headers emitted in delegated mode.

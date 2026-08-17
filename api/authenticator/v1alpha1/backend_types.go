@@ -270,6 +270,26 @@ type BackendSpec struct {
 	// +kubebuilder:default={}
 	GroupMapping GroupMapping `json:"groupMapping,omitempty"`
 
+	// GroupsHeaderSeparator is the single character the authorizer joins the
+	// impersonated group names with when it returns them to the proxy as one
+	// groups header value, and the character the paired Envoy Lua split filter
+	// must split that value back on. It defaults to a comma. Choose an alternate
+	// character — a vertical pipe ("|") is the conventional choice — when group
+	// names may themselves contain a comma, such as LDAP-style distinguished
+	// names like "cn=bob,o=example", which the comma encoding cannot represent:
+	// the split filter would fan one such group into several. The authorizer
+	// denies, fail-closed, any request whose groups contain the active separator
+	// character, so a group name can never be split or smuggled; picking a
+	// separator that appears in no group name is what makes those groups usable.
+	// The value must be exactly one printable, non-space ASCII character. The Lua
+	// split filter on the proxy serving this Backend's host must be configured
+	// with the same character; the two are a matched pair.
+	//
+	// +optional
+	// +kubebuilder:default=","
+	// +kubebuilder:validation:Pattern=`^[!-~]$`
+	GroupsHeaderSeparator string `json:"groupsHeaderSeparator,omitempty"`
+
 	// CredentialsSecretRef names the Secret holding the backend's privileged
 	// Kubernetes credential — the impersonator identity the authorizer
 	// authenticates to the upstream API server with. A Secret named

@@ -277,7 +277,7 @@ func TestCheckAllowSetsUIDAndExtraHeaders(t *testing.T) {
 // survives to the paired Lua split filter.
 func TestOkResponseGroupsHeaderIsCommaJoinedOverwrite(t *testing.T) {
 	s := &CheckServer{groupsHeader: "x-custom-groups", log: logr.Discard()}
-	resp := s.okResponse(&Identity{Username: "alice", Groups: []string{"dev", "ops"}}, "tok")
+	resp := s.okResponse(&Identity{Username: "alice", Groups: []string{"dev", "ops"}}, DefaultGroupsSeparator, "tok")
 
 	assertHeaderOptions(t, resp.GetOkResponse().GetHeaders(), []*corev3.HeaderValueOption{
 		overwriteHeader(headerImpersonateUser, "alice"),
@@ -301,7 +301,7 @@ func TestOkResponseGroupsHeaderIsCommaJoinedOverwrite(t *testing.T) {
 // groups header falls back to the default x-impersonate-groups name (AC #2).
 func TestOkResponseGroupsHeaderDefaultName(t *testing.T) {
 	s := &CheckServer{log: logr.Discard()}
-	resp := s.okResponse(&Identity{Username: "alice", Groups: []string{"dev"}}, "tok")
+	resp := s.okResponse(&Identity{Username: "alice", Groups: []string{"dev"}}, DefaultGroupsSeparator, "tok")
 	assertHeaderOptions(t, resp.GetOkResponse().GetHeaders(), []*corev3.HeaderValueOption{
 		overwriteHeader(headerImpersonateUser, "alice"),
 		overwriteHeader("x-impersonate-groups", "dev"),
@@ -322,7 +322,7 @@ func TestOkResponseSetsUIDAndExtraHeaders(t *testing.T) {
 		Groups:   []string{"dev", "ops"},
 		// Deliberately out of lexical order to prove the emission is sorted.
 		Extra: map[string]string{"tenant": "acme", "email": "alice@example.com"},
-	}, "tok")
+	}, DefaultGroupsSeparator, "tok")
 
 	assertHeaderOptions(t, resp.GetOkResponse().GetHeaders(), []*corev3.HeaderValueOption{
 		overwriteHeader(headerImpersonateUser, "alice@example.com"),
@@ -349,7 +349,7 @@ func TestOkResponseSetsUIDAndExtraHeaders(t *testing.T) {
 // the backward-compatible default (only user, groups, Authorization).
 func TestOkResponseOmitsUIDAndExtraWhenUnset(t *testing.T) {
 	s := &CheckServer{log: logr.Discard()}
-	resp := s.okResponse(&Identity{Username: "alice", Groups: []string{"dev"}}, "tok")
+	resp := s.okResponse(&Identity{Username: "alice", Groups: []string{"dev"}}, DefaultGroupsSeparator, "tok")
 	assertHeaderOptions(t, resp.GetOkResponse().GetHeaders(), []*corev3.HeaderValueOption{
 		overwriteHeader(headerImpersonateUser, "alice"),
 		overwriteHeader(defaultGroupsHeader, "dev"),
@@ -460,6 +460,90 @@ func TestCheckDeniesUnsafeGroup(t *testing.T) {
 
 			resp := mustCheck(t, client, checkRequest(host, map[string]string{"authorization": "Bearer good"}))
 			assertDenied(t, resp, typev3.StatusCode_Forbidden)
+		})
+	}
+}
+
+// TestCheckCustomGroupsSeparatorAllowsCommaBearingGroup asserts a Backend that
+// configures a non-comma spec.groupsHeaderSeparator (Entry.GroupsSeparator) can
+// carry a group whose name legitimately contains a comma — the LDAP-style DN
+// "cn=bob,o=example" — without the unsafe-group guard denying it: the groups are
+// joined on the configured separator ("|"), so the paired Lua split filter (also
+// configured with "|") cannot fan the DN into multiple groups.
+func TestCheckCustomGroupsSeparatorAllowsCommaBearingGroup(t *testing.T) {
+	const host = "api.example.com"
+	store := NewStore()
+	store.Set(testNamespace+"/backend", &Entry{
+		Host:                 host,
+		Authenticator:        newTestAuthenticator(t, map[string]any{"sub": "alice", "groups": []any{"cn=bob,o=example", "ops"}}, "sub"),
+		CredentialsSecretRef: authenticatorv1alpha1.SecretReference{Name: "creds"},
+		GroupsSeparator:      "|",
+	})
+	reader := secretReader(t, credentialSecret("creds", "impersonator-token"))
+	client := serveCheck(t, NewCheckServer(store, reader, nil, testNamespace, "", logr.Discard()))
+
+	resp := mustCheck(t, client, checkRequest(host, map[string]string{
+		"authorization": "Bearer caller-token",
+	}))
+	if got, want := codes.Code(resp.GetStatus().GetCode()), codes.OK; got != want {
+		t.Fatalf("status code = %v, want %v", got, want)
+	}
+	assertHeaderOptions(t, resp.GetOkResponse().GetHeaders(), []*corev3.HeaderValueOption{
+		overwriteHeader(headerImpersonateUser, "alice"),
+		overwriteHeader(defaultGroupsHeader, "cn=bob,o=example|ops"),
+		overwriteHeader(headerAuthorization, "Bearer impersonator-token"),
+	})
+}
+
+// TestCheckCustomGroupsSeparatorDeniesSeparatorBearingGroup asserts the
+// unsafe-group guard follows the configured separator: with
+// Entry.GroupsSeparator "|", a mapped group containing "|" is denied fail-closed
+// (it would fan into multiple groups at the split filter), while the comma is no
+// longer rejected (the previous test). The guard and the join are a matched pair
+// keyed on the same separator.
+func TestCheckCustomGroupsSeparatorDeniesSeparatorBearingGroup(t *testing.T) {
+	const host = "api.example.com"
+	store := NewStore()
+	store.Set(testNamespace+"/backend", &Entry{
+		Host:                 host,
+		Authenticator:        newTestAuthenticator(t, map[string]any{"sub": "alice", "groups": []any{"dev|system:masters"}}, "sub"),
+		CredentialsSecretRef: authenticatorv1alpha1.SecretReference{Name: "creds"},
+		GroupsSeparator:      "|",
+	})
+	reader := secretReader(t, credentialSecret("creds", "imp"))
+	client := serveCheck(t, NewCheckServer(store, reader, nil, testNamespace, "", logr.Discard()))
+
+	resp := mustCheck(t, client, checkRequest(host, map[string]string{"authorization": "Bearer good"}))
+	assertDenied(t, resp, typev3.StatusCode_Forbidden)
+}
+
+// TestValidateGroupsSeparator asserts the separator validation the reconciler
+// uses: any single printable, non-space ASCII character passes (comma and the
+// conventional vertical pipe included), while an empty value, a multi-character
+// value, whitespace, a control byte, and a non-ASCII character are rejected.
+func TestValidateGroupsSeparator(t *testing.T) {
+	for _, in := range []string{",", "|", ";", "~", "!"} {
+		t.Run("valid/"+in, func(t *testing.T) {
+			if err := ValidateGroupsSeparator(in); err != nil {
+				t.Errorf("ValidateGroupsSeparator(%q) returned error: %v", in, err)
+			}
+		})
+	}
+	invalid := map[string]string{
+		"empty":       "",
+		"multi-char":  "||",
+		"space":       " ",
+		"tab":         "\t",
+		"control":     "\x00",
+		"non-ascii":   "•",
+		"del":         "\x7f",
+		"trailing-ws": ", ",
+	}
+	for name, in := range invalid {
+		t.Run("invalid/"+name, func(t *testing.T) {
+			if err := ValidateGroupsSeparator(in); err == nil {
+				t.Errorf("ValidateGroupsSeparator(%q) = nil, want error", in)
+			}
 		})
 	}
 }
@@ -1362,6 +1446,44 @@ func TestCheckDelegatedModeMultipleGroupsRoundTrip(t *testing.T) {
 	})
 }
 
+// TestCheckDelegatedModeCustomSeparatorRoundTrip asserts the passthrough groups
+// are re-emitted joined on the backend's configured separator: the inbound
+// impersonate-group value is still split on commas (Envoy's fixed
+// duplicate-header join, independent of the configured separator), but the
+// outbound groups header joins the recovered groups with Entry.GroupsSeparator
+// so the matching Lua split filter unpacks them correctly.
+func TestCheckDelegatedModeCustomSeparatorRoundTrip(t *testing.T) {
+	const host = "api.example.com"
+	store := NewStore()
+	store.Set(testNamespace+"/backend", &Entry{
+		Host: host,
+		Authenticator: newImpersonationAuthenticator(t, map[string]any{
+			"sub": "actor-sub", "email": "actor@example.com", "groups": []any{"platform-admins"},
+		}, "sub", impersonationExtraEmailUID),
+		CredentialsSecretRef: authenticatorv1alpha1.SecretReference{Name: "creds"},
+		GroupsSeparator:      "|",
+		Impersonation:        resolvedImpersonation([]string{"platform-admins"}, impersonationExtraEmailUID),
+	})
+	reader := secretReader(t, credentialSecret("creds", "impersonator-token"))
+	client := serveCheck(t, NewCheckServer(store, reader, nil, testNamespace, "", logr.Discard()))
+
+	resp := mustCheck(t, client, checkRequest(host, map[string]string{
+		"authorization":     "Bearer caller",
+		"impersonate-user":  "target-user",
+		"impersonate-group": "dev,ops",
+	}))
+	if got, want := codes.Code(resp.GetStatus().GetCode()), codes.OK; got != want {
+		t.Fatalf("status code = %v, want %v", got, want)
+	}
+	assertHeaderOptions(t, resp.GetOkResponse().GetHeaders(), []*corev3.HeaderValueOption{
+		overwriteHeader(headerImpersonateUser, "target-user"),
+		overwriteHeader(defaultGroupsHeader, "dev|ops"),
+		overwriteHeader(headerImpersonateExtraPrefix+"actor-email", "actor@example.com"),
+		overwriteHeader(headerImpersonateExtraPrefix+"actor-uid", "actor-sub"),
+		overwriteHeader(headerAuthorization, "Bearer impersonator-token"),
+	})
+}
+
 // TestCheckDelegatedModeRequiresTargetUser asserts that an authorized actor supplying
 // only groups/UID/extras but NO Impersonate-User is denied 403: Kubernetes rejects
 // impersonation without a target user, so the authorizer must not emit an OK that
@@ -1597,7 +1719,7 @@ func TestLogResponseHeadersLogsEachOkHeader(t *testing.T) {
 	s := &CheckServer{log: logr.New(sink)}
 
 	identity := &Identity{Username: "alice", Groups: []string{"dev", "ops"}}
-	s.logResponseHeaders("api.example.com", s.okResponse(identity, "impersonator-token"))
+	s.logResponseHeaders("api.example.com", s.okResponse(identity, DefaultGroupsSeparator, "impersonator-token"))
 
 	summary := sink.find(t, "returning response headers to caller")
 	if got, want := summary.kv["decision"], "ok"; got != want {
@@ -1681,7 +1803,7 @@ func TestLogResponseHeadersDisabledNoOp(t *testing.T) {
 	sink := newCaptureSink(false)
 	s := &CheckServer{log: logr.New(sink)}
 
-	s.logResponseHeaders("api.example.com", s.okResponse(&Identity{Username: "alice"}, "tok"))
+	s.logResponseHeaders("api.example.com", s.okResponse(&Identity{Username: "alice"}, DefaultGroupsSeparator, "tok"))
 
 	if got := len(sink.snapshot()); got != 0 {
 		t.Errorf("logged %d entries with debug disabled, want 0", got)

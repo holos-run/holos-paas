@@ -55,6 +55,15 @@ type Entry struct {
 	// CredentialsSecretRef Secret path (HOL-1400).
 	ServiceAccountRef *authenticatorv1alpha1.ServiceAccountReference
 
+	// GroupsSeparator is the single character the Check path joins the
+	// impersonated groups with into the single groups header value
+	// (spec.groupsHeaderSeparator, default ","), and the character the
+	// unsafe-group guard rejects inside a group name. The reconciler records it
+	// validated and normalized (an empty spec value becomes the default comma), so
+	// the Check path applies no further defaulting beyond the zero-value fallback
+	// in groupsSeparator.
+	GroupsSeparator string
+
 	// Impersonation is the resolved delegated-impersonation config
 	// (spec.impersonation), or nil when the Backend omits it (delegated
 	// impersonation disabled — the fail-closed default). The reconciler builds it
@@ -63,6 +72,16 @@ type Entry struct {
 	// Impersonate-* headers. This phase populates it but the Check path does not yet
 	// consume it, so request-path behavior is unchanged (HOL-1432).
 	Impersonation *ResolvedImpersonation
+}
+
+// groupsSeparator returns the Entry's configured groups-header separator,
+// defaulting to DefaultGroupsSeparator (",") when unset so a zero-value Entry
+// (e.g. one built directly in tests) behaves as the documented default.
+func (e *Entry) groupsSeparator() string {
+	if e.GroupsSeparator == "" {
+		return DefaultGroupsSeparator
+	}
+	return e.GroupsSeparator
 }
 
 // ResolvedImpersonation is the reconciler-resolved form of spec.impersonation,

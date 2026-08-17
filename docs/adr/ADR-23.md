@@ -23,6 +23,7 @@
 | 11       | 2026-07-01 | @jeffmccune | Delegated impersonation (`kubectl --as` passthrough, HOL-1429/HOL-1430/HOL-1433) — additive `spec.impersonation` (`groups` allowlist + actor attribution extras, later renamed and tightened by Rev 12); inbound `Impersonate-*` is no longer *always* denied but is the self-vs-delegated **mode switch**; an authorized actor's target passes through, target authz is delegated to the impersonator SA's API-server RBAC, and the AC6 rule disables the actor-derived self identity in delegated mode (below) |
 | 12       | 2026-07-03 | @jeffmccune | Delegated impersonation cleanup (HOL-1448/HOL-1449/HOL-1450/HOL-1451) — rename the actor attribution field to `spec.impersonation.extra`, scope extras by mode (`oidc.extra` in self mode only, `impersonation.extra` in delegated mode only), deny every inbound `Impersonate-Extra-*` fail-closed in both modes, remove cross-field extra-key overlap validation, and promote delegated allow/deny decisions to Info-level audit logs (below) |
 | 13       | 2026-07-09 | @jeffmccune | Holos Substrate rebrand (HOL-1546): references to the removed prototype binary are dropped from the prose (ADR-12 Rev 7). No decision change. |
+| 14       | 2026-08-16 | @jeffmccune | Configurable groups-header separator — additive `spec.groupsHeaderSeparator` (default `,`) so group names that contain a comma (LDAP DNs like `cn=bob,o=example`) round-trip through the groups header + Lua split without being fanned into multiple groups; the `firstUnsafeGroup` guard follows the configured separator (below) |
 
 ## As-built (Revision 2)
 
@@ -684,6 +685,41 @@ a Keycloak group was ignored.
   split round-trip has the same losslessness requirement. The username is still a single
   overwrite header. Like Revision 6's filter, the reject/split filters belong to the
   deferred waypoint topology and are not yet rendered by the component.
+
+## Configurable groups-header separator (Revision 14)
+
+Revision 14 makes the join character of the Revision 7 groups-header encoding
+configurable per `Backend`. The character was previously hardcoded to a comma at
+both ends of the round-trip — the authorizer's `strings.Join(groups, ",")` and
+the Lua split filter's `[^,]+` character class — which made a group name that
+itself contains a comma unrepresentable: the `firstUnsafeGroup` guard denied it
+fail-closed (correctly, since the split filter would otherwise fan
+`cn=bob,o=example` into the two groups `cn=bob` and `o=example`). LDAP-style
+distinguished names are exactly such group names.
+
+- **Additive `spec.groupsHeaderSeparator`.** A new optional Backend field,
+  defaulting to `,` (byte-for-byte backward compatible), constrained by the CRD
+  to exactly one printable, non-space ASCII character (`^[!-~]$`) and
+  re-validated defensively by the reconciler. The resolved separator is recorded
+  on the store `Entry`, and both self-mode and delegated-mode responses join the
+  groups with it. The conventional alternate is the vertical pipe (`|`).
+- **The unsafe-group guard follows the separator.** `firstUnsafeGroup` now
+  rejects a group containing the *active* separator (plus surrounding
+  whitespace, unchanged): with `groupsHeaderSeparator: "|"`, comma-bearing
+  groups are allowed and `|`-bearing groups are denied instead. The guard, the
+  join, and the split filter remain a matched set keyed on one character.
+- **Scope: the outbound encoding only.** The inbound delegated-mode
+  `Impersonate-Group` split stays on the comma — that comma is Envoy's fixed
+  duplicate-header join, not ours — so a comma-bearing group still cannot be
+  *supplied* via `kubectl --as-group` passthrough; it can only be *derived* from
+  the validated token. The per-deployment `--impersonate-groups-header` flag
+  (the header's *name*) is unchanged and orthogonal.
+- **The split Lua filter is parameterized.** The runbook's split filter examples
+  now hold the separator in a `sep` variable (Lua-pattern-escaped), with the
+  requirement that Backends sharing one split filter use the same separator. See
+  the [runbook's *Splitting the comma-joined groups
+  header*](../runbooks/holos-authenticator.md#splitting-the-comma-joined-groups-header)
+  section.
 
 ## Smuggling prevention is the authenticator's responsibility; Lua filter ordering (Revision 8)
 
