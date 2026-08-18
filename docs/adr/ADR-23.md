@@ -23,6 +23,7 @@
 | 11       | 2026-07-01 | @jeffmccune | Delegated impersonation (`kubectl --as` passthrough, HOL-1429/HOL-1430/HOL-1433) — additive `spec.impersonation` (`groups` allowlist + actor attribution extras, later renamed and tightened by Rev 12); inbound `Impersonate-*` is no longer *always* denied but is the self-vs-delegated **mode switch**; an authorized actor's target passes through, target authz is delegated to the impersonator SA's API-server RBAC, and the AC6 rule disables the actor-derived self identity in delegated mode (below) |
 | 12       | 2026-07-03 | @jeffmccune | Delegated impersonation cleanup (HOL-1448/HOL-1449/HOL-1450/HOL-1451) — rename the actor attribution field to `spec.impersonation.extra`, scope extras by mode (`oidc.extra` in self mode only, `impersonation.extra` in delegated mode only), deny every inbound `Impersonate-Extra-*` fail-closed in both modes, remove cross-field extra-key overlap validation, and promote delegated allow/deny decisions to Info-level audit logs (below) |
 | 13       | 2026-07-09 | @jeffmccune | Holos Substrate rebrand (HOL-1546): references to the removed prototype binary are dropped from the prose (ADR-12 Rev 7). No decision change. |
+| 14       | 2026-08-16 | @jeffmccune | Configurable groups-header separator, default **`\|`** — `spec.groupsHeaderSeparator` replaces the hardcoded comma join; the default is a vertical pipe because comma-bearing LDAP/AD distinguished names (`cn=bob,o=example`) are common group names, and the `firstUnsafeGroup` guard follows the configured separator (below) |
 
 ## As-built (Revision 2)
 
@@ -36,10 +37,11 @@ with the deviations noted below. `Status` is now `Implemented`.
   conditional for an authorized actor by Revision 11's delegated mode), validates
   the OIDC token (issuer discovery + JWKS, `iss`/`aud`/`exp`), maps claims to
   groups via CEL (default `claims["<groupsClaim>"]`, i.e. `claims["groups"]`),
-  and returns `Impersonate-User` plus a single comma-joined groups header and the
-  impersonator credential, overwriting `Authorization` (the groups are emitted as
-  one comma-joined **overwrite/set** header — `X-Impersonate-Groups` by default,
-  configurable — that a paired Lua split filter unpacks into one
+  and returns `Impersonate-User` plus a single separator-joined groups header and
+  the impersonator credential, overwriting `Authorization` (the groups are emitted
+  as one separator-joined **overwrite/set** header — `X-Impersonate-Groups` by
+  default, joined on `|` per Revision 14, both configurable — that a paired Lua
+  split filter unpacks into one
   `Impersonate-Group` per group, **not** per-group append options Envoy drops —
   Revision 7, superseding Revision 6). The
   `authenticator.holos.run/v1alpha1`
@@ -434,7 +436,7 @@ two — the **UID** (`Impersonate-Uid`) and **extra fields**
 - **Single-valued → direct overwrite headers, no Lua split.** Both `Impersonate-Uid`
   and each `Impersonate-Extra-<key>` are single values, so they are emitted directly
   under their `Impersonate-*` names with the **overwrite/set** action — exactly like
-  `Impersonate-User`. The comma-join + Lua split the multi-valued **groups** header
+  `Impersonate-User`. The separator-join + Lua split the multi-valued **groups** header
   requires (Revision 7, HOL-1416, to survive Envoy's ext_authz append-drop) does
   **not** apply: a single overwrite header is added unconditionally by Envoy
   (`setCopy`). No new Lua filter or `--impersonate-groups-header`-style flag is
@@ -477,7 +479,7 @@ fail-closed — but it is enforced by an authorization check, not a blanket reje
 
 - **Self impersonation (default, no inbound non-extra impersonation target).**
   Validate the caller's token and impersonate the caller's derived identity:
-  `Impersonate-User`, the comma-joined groups header, derived
+  `Impersonate-User`, the separator-joined groups header, derived
   `Impersonate-Uid`, and `spec.oidc.extra`. Self mode never emits
   `spec.impersonation.extra`. A nil `spec.impersonation` Backend has only this OK
   path and **denies any inbound `Impersonate-*` header** fail-closed.
@@ -486,7 +488,7 @@ fail-closed — but it is enforced by an authorization check, not a blanket reje
   the **mode switch**. The validated token identifies an **actor**; if the actor
   is authorized (below), the actor-supplied target is forwarded to the upstream:
   `Impersonate-User`, optional `Impersonate-Uid`, and `--as-group` values
-  re-emitted through the comma-joined groups header. The authorizer also stamps
+  re-emitted through the separator-joined groups header. The authorizer also stamps
   `spec.impersonation.extra` from the actor token. Delegated mode never emits the
   actor-derived `Impersonate-User`/groups/`Impersonate-Uid`/`spec.oidc.extra`.
   Every inbound `Impersonate-Extra-*` header is denied before mode selection, so
@@ -542,7 +544,7 @@ a Backend that omits it is fully backward-compatible):
   `Impersonate-Extra-*`, an unrecognized `Impersonate-*` header, a delegated
   request with no `Impersonate-User` target, or a passthrough group with
   **surrounding whitespace** — all Denied (403), never OK. The delegated-mode
-  passthrough groups round-trip through the same comma-joined groups header + Lua
+  passthrough groups round-trip through the same separator-joined groups header + Lua
   split filter self mode uses (Revision 7): the actor's inbound `Impersonate-Group`
   is **split on commas** into individual groups (a comma is a group *separator*, not
   a denial — `dev,ops` is two groups), and the `firstUnsafeGroup` guard then denies
@@ -611,8 +613,8 @@ applies them.
   runs — **not** the authenticator's own pods (the authenticator is the ext_authz
   *service*, not a proxy on the request path). The worked `EnvoyFilter` (`targetRefs`
   to the waypoint `Gateway`, the `INSERT_AFTER` `envoy.filters.http.ext_authz` patch,
-  and the `inline_code` Lua) is in the [runbook's *Splitting the comma-joined groups
-  header*](../runbooks/holos-authenticator.md#splitting-the-comma-joined-groups-header)
+  and the `inline_code` Lua) is in the [runbook's *Splitting the groups
+  header*](../runbooks/holos-authenticator.md#splitting-the-groups-header)
   section (updated for Revision 7's encoding).
 - **Unsafe group values are denied fail-closed.** The comma-join + split round-trip
   is lossless only if no single group value contains a comma **or** has
@@ -674,8 +676,8 @@ a Keycloak group was ignored.
   configured groups header or any `Impersonate-*` header — the same fail-closed guard
   the authorizer enforces server-side (now extended to the configured groups header),
   at the proxy as defense in depth. The worked split `EnvoyFilter` and the
-  optional-reject guidance are in the [runbook's *Splitting the comma-joined groups
-  header*](../runbooks/holos-authenticator.md#splitting-the-comma-joined-groups-header)
+  optional-reject guidance are in the [runbook's *Splitting the groups
+  header*](../runbooks/holos-authenticator.md#splitting-the-groups-header)
   section. (**Revision 8** ratifies that only the split filter is required — smuggling
   prevention is the authenticator's responsibility — and that it is ordered after
   ext_authz with `filterClass: AUTHZ`.)
@@ -683,7 +685,50 @@ a Keycloak group was ignored.
   or surrounding whitespace is denied 403) carries over verbatim — the comma-join +
   split round-trip has the same losslessness requirement. The username is still a single
   overwrite header. Like Revision 6's filter, the reject/split filters belong to the
-  deferred waypoint topology and are not yet rendered by the component.
+  deferred waypoint topology and are not yet rendered by the component. (Revision 14
+  later makes the join character configurable per Backend and changes the default
+  from the comma to a vertical pipe — see below.)
+
+## Configurable groups-header separator, default `|` (Revision 14)
+
+Revision 14 makes the join character of the Revision 7 groups-header encoding
+configurable per `Backend` — and changes the default from a comma to a
+**vertical pipe**. The character was previously hardcoded to a comma at both
+ends of the round-trip — the authorizer's `strings.Join(groups, ",")` and the
+Lua split filter's `[^,]+` character class — which made a group name that
+itself contains a comma unrepresentable: the `firstUnsafeGroup` guard denied it
+fail-closed (correctly, since the split filter would otherwise fan
+`cn=bob,o=example` into the two groups `cn=bob` and `o=example`). LDAP- and
+Active-Directory-style distinguished names are exactly such group names, and
+they are **common** in enterprise identity providers — common enough that the
+comma is the wrong default, not merely a configurable inconvenience.
+
+- **`spec.groupsHeaderSeparator`, default `|`.** A new optional Backend field
+  constrained by the CRD to exactly one printable, non-space ASCII character
+  (`^[!-~]$`) and re-validated defensively by the reconciler. The resolved
+  separator is recorded on the store `Entry`, and both self-mode and
+  delegated-mode responses join the groups with it. The **default is the
+  vertical pipe** so DN-style group names work out of the box; deployments whose
+  group names can contain `|` configure a different character. (The default was
+  deliberately changed pre-release with no backward-compatibility shim — the
+  comma default never shipped.)
+- **The unsafe-group guard follows the separator.** `firstUnsafeGroup` rejects a
+  group containing the *active* separator (plus surrounding whitespace,
+  unchanged): under the default `|`, comma-bearing groups are allowed and
+  `|`-bearing groups are denied. The guard, the join, and the split filter
+  remain a matched set keyed on one character.
+- **Scope: the outbound encoding only.** The inbound delegated-mode
+  `Impersonate-Group` split stays on the comma — that comma is Envoy's fixed
+  duplicate-header join, not ours — so a comma-bearing group still cannot be
+  *supplied* via `kubectl --as-group` passthrough; it can only be *derived* from
+  the validated token. The per-deployment `--impersonate-groups-header` flag
+  (the header's *name*) is unchanged and orthogonal.
+- **The split Lua filter is parameterized.** The runbook's split filter examples
+  hold the separator in a `sep` variable (Lua-pattern-escaped) defaulting to
+  `"|"`, with the requirement that Backends sharing one split filter use the
+  same separator. See the [runbook's *Splitting the groups
+  header*](../runbooks/holos-authenticator.md#splitting-the-groups-header)
+  section.
 
 ## Smuggling prevention is the authenticator's responsibility; Lua filter ordering (Revision 8)
 
@@ -697,14 +742,15 @@ authorizer already does, or couple a filter to an unstable Envoy filter name.
   `EnvoyFilter` is required for it.** The authorizer denies, fail-closed on every
   `Check`, any request carrying an `Impersonate-*` header or a copy of the
   configured groups header (default `X-Impersonate-Groups`), and denies any request
-  whose mapped groups contain a comma or surrounding whitespace (`firstUnsafeGroup`,
+  whose mapped groups contain the active groups separator (default `|`, Revision 14)
+  or surrounding whitespace (`firstUnsafeGroup`,
   `internal/authenticator/server.go`). Those server-side guards — with spoofed-header
   unit tests (`internal/authenticator/server_test.go`) — are the smuggling defense:
   a client cannot inject a privileged group under the backend's impersonation
   credential. The **reject** Lua filter the runbook documents (before ext_authz) is
   therefore **optional defense in depth**, not a requirement. The only Lua filter
   actually required on the request path is the **split** filter that unpacks the
-  comma-joined groups header into one `Impersonate-Group` per group — a header-*shape*
+  separator-joined groups header into one `Impersonate-Group` per group — a header-*shape*
   adaptation the Kubernetes API server's one-header-per-group impersonation contract
   forces, not a security control.
 - **Filter ordering relative to ext_authz: prefer `filterClass: AUTHZ`.** The split
@@ -868,17 +914,17 @@ On each request Envoy forwards to the authorizer's `Check`, the authenticator
    claim directly to Kubernetes groups; a backend may override it (e.g. to derive
    groups from a different claim, prefix them, or filter them).
 5. **Returns Kubernetes impersonation headers.** On success it returns an
-   `OkResponse` injecting `Impersonate-User` and a single comma-joined groups
-   header (the mapped groups as one CSV value under the configured groups header,
-   default `X-Impersonate-Groups`), plus the backend's own
+   `OkResponse` injecting `Impersonate-User` and a single separator-joined groups
+   header (the mapped groups as one joined value under the configured groups header,
+   default `X-Impersonate-Groups` joined on `|` — Revision 14), plus the backend's own
    privileged credential (an `Authorization: Bearer <token>` for a ServiceAccount
    holding the `impersonate` verb), having first removed every inbound
    impersonation/`Authorization` header per step 2 so only the derived values reach
    the upstream. The groups header uses the **overwrite/set** action (Envoy adds it
    unconditionally), **not** per-group append options Envoy silently drops; because
    the API server requires one `Impersonate-Group` header per group and does not
-   split a comma-separated value, this header **must be paired with an Envoy Lua
-   filter** that unpacks the comma list into one `Impersonate-Group` per group before
+   split a joined value, this header **must be paired with an Envoy Lua
+   filter** that unpacks the joined list into one `Impersonate-Group` per group before
    the request reaches the upstream — see Revision 7 below and the
    [runbook](../runbooks/holos-authenticator.md). Envoy then forwards the request
    to the upstream API server with those headers and **no other reverse proxy** in

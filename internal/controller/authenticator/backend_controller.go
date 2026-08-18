@@ -126,6 +126,22 @@ func (r *BackendReconciler) reconcileNormal(ctx context.Context, logger logr.Log
 			fmt.Sprintf("invalid spec.server.url: %v", err))
 	}
 
+	// Validate the groups-header separator. The CRD pattern already restricts it
+	// to a single printable, non-space ASCII character, but re-validate
+	// defensively (like the server URL) so an Entry is never built with a
+	// separator the join/split round-trip cannot use. An empty value — the CRD
+	// default populates "|" for API-served objects — normalizes to the default
+	// vertical pipe so a CR that bypassed defaulting still behaves as documented.
+	groupsSeparator := backend.Spec.GroupsHeaderSeparator
+	if groupsSeparator == "" {
+		groupsSeparator = authenticator.DefaultGroupsSeparator
+	}
+	if err := authenticator.ValidateGroupsSeparator(groupsSeparator); err != nil {
+		r.Store.DeleteByKey(key)
+		return r.reject(ctx, backend, ReasonInvalidSpec,
+			fmt.Sprintf("invalid spec.groupsHeaderSeparator: %v", err))
+	}
+
 	// Validate the extra-mapping keys: each is emitted verbatim as the suffix of an
 	// Impersonate-Extra-<key> header, so it must be a valid HTTP header token. A bad
 	// key is an invalid spec (Accepted=False) — like a malformed CEL expression or a
@@ -239,6 +255,7 @@ func (r *BackendReconciler) reconcileNormal(ctx context.Context, logger logr.Log
 		ServerCABundle:       backend.Spec.Server.CABundle,
 		CredentialsSecretRef: credRef,
 		ServiceAccountRef:    saRef,
+		GroupsSeparator:      groupsSeparator,
 		Impersonation:        impersonation,
 	}
 	if !r.Store.Set(key, entry) {

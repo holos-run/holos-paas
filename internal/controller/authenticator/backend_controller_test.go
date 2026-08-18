@@ -569,6 +569,102 @@ func TestReconcileInvalidServerURLRejects(t *testing.T) {
 	}
 }
 
+// TestReconcileGroupsHeaderSeparatorDefaulted asserts a Backend that omits
+// spec.groupsHeaderSeparator round-trips with the CRD default vertical pipe and
+// its registered Store entry carries that default, so the Check path joins
+// groups on "|" — the separator that keeps comma-bearing LDAP/AD distinguished
+// names representable.
+func TestReconcileGroupsHeaderSeparatorDefaulted(t *testing.T) {
+	ctx := context.Background()
+	ns := makeNamespace(ctx, t)
+
+	r, store, _ := newReconciler(discoverOK)
+	key := createBackend(ctx, t, makeBackend(ns, "backend-sep-default", "api-sep-default.example.test"))
+
+	if _, err := reconcile(ctx, r, key); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	b := getBackend(ctx, t, key)
+	if got := b.Spec.GroupsHeaderSeparator; got != "|" {
+		t.Errorf("spec.groupsHeaderSeparator = %q, want the CRD default \"|\"", got)
+	}
+	entry, ok := store.Get("api-sep-default.example.test")
+	if !ok {
+		t.Fatalf("store missing entry for host api-sep-default.example.test")
+	}
+	if got := entry.GroupsSeparator; got != "|" {
+		t.Errorf("entry.GroupsSeparator = %q, want \"|\"", got)
+	}
+}
+
+// TestReconcileCustomGroupsHeaderSeparator asserts a Backend configuring a
+// non-default spec.groupsHeaderSeparator ("," here) becomes Ready and its
+// registered Store entry carries the custom separator, so the Check path joins
+// groups (and guards group names) on that character instead of the default "|".
+func TestReconcileCustomGroupsHeaderSeparator(t *testing.T) {
+	ctx := context.Background()
+	ns := makeNamespace(ctx, t)
+
+	r, store, _ := newReconciler(discoverOK)
+	b := makeBackend(ns, "backend-sep-comma", "api-sep-comma.example.test")
+	b.Spec.GroupsHeaderSeparator = ","
+	key := createBackend(ctx, t, b)
+
+	if _, err := reconcile(ctx, r, key); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := getBackend(ctx, t, key)
+	if s := condStatus(got, ConditionReady); s != metav1.ConditionTrue {
+		t.Errorf("Ready = %q, want True", s)
+	}
+	entry, ok := store.Get("api-sep-comma.example.test")
+	if !ok {
+		t.Fatalf("store missing entry for host api-sep-comma.example.test")
+	}
+	if got := entry.GroupsSeparator; got != "," {
+		t.Errorf("entry.GroupsSeparator = %q, want \",\"", got)
+	}
+}
+
+// TestBackendGroupsHeaderSeparatorRejectsInvalid asserts the CRD pattern rejects
+// a separator that is not exactly one printable, non-space ASCII character at
+// admission: a multi-character value, an explicit empty string, and a space are
+// all refused before the reconciler ever sees them (the reconciler re-validates
+// defensively for CRs that bypassed admission).
+func TestBackendGroupsHeaderSeparatorRejectsInvalid(t *testing.T) {
+	ctx := context.Background()
+	ns := makeNamespace(ctx, t)
+
+	for name, sep := range map[string]string{
+		"multi-char": "||",
+		"empty":      "",
+		"space":      " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := makeBackend(ns, "backend-sep-bad-"+name, "api-sep-bad.example.test")
+			b.Spec.GroupsHeaderSeparator = sep
+			// An empty string is indistinguishable from an omitted field after
+			// omitempty serialization, so it takes the CRD default instead of
+			// failing the pattern; assert the defaulted round-trip for that case.
+			err := shared.k8sClient.Create(ctx, b)
+			if sep == "" {
+				if err != nil {
+					t.Fatalf("creating Backend with omitted separator: %v", err)
+				}
+				if got := getBackend(ctx, t, client.ObjectKeyFromObject(b)).Spec.GroupsHeaderSeparator; got != "|" {
+					t.Errorf("spec.groupsHeaderSeparator = %q, want defaulted \"|\"", got)
+				}
+				return
+			}
+			if err == nil {
+				t.Errorf("creating Backend with groupsHeaderSeparator %q succeeded, want admission rejection", sep)
+			}
+		})
+	}
+}
+
 // TestReconcileDiscoveryFailureNotReady asserts a Backend whose OIDC discovery
 // fails is marked Programmed/Ready=False (reason DiscoveryFailed), requeues with
 // an error, and is not registered in the store. Accepted stays True (the spec was
